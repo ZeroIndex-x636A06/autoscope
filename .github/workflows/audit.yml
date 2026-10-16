@@ -15,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: syntax
@@ -36,13 +36,13 @@ jobs:
         env:
           STEPS: ${{ toJSON(steps) }}
         run: |
-          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$STEPS" | jq -r 'to_entries[] | select(.key|test("^[0-9a-f]{32}$")|not) | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
           ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
 
   install-and-detect:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: autoscope src   # path with spaces on purpose
       # Installer is interactive: answer "1" (system package) like a new user.
@@ -53,6 +53,10 @@ jobs:
       - id: installed
         continue-on-error: true
         run: test -x /usr/local/bin/autoscope && command -v xrandr
+      # If the installer aborted (e.g. no gamescope package on this release),
+      # put the script in place anyway so the detection checks below still run.
+      - name: fallback install of the autoscope script (harness only)
+        run: test -x /usr/local/bin/autoscope || sudo install -m755 "autoscope src/autoscope" /usr/local/bin/autoscope
       - id: real_gamescope_present
         continue-on-error: true
         run: command -v gamescope && (gamescope --help 2>&1 | head -5)
@@ -125,5 +129,5 @@ jobs:
         env:
           STEPS: ${{ toJSON(steps) }}
         run: |
-          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$STEPS" | jq -r 'to_entries[] | select(.key|test("^[0-9a-f]{32}$")|not) | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
           ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
