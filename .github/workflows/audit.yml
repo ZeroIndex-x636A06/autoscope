@@ -1,0 +1,129 @@
+# Weekly-audit harness: installs autoscope via its installer, then checks
+# resolution detection against faked displays (stub xrandr + a tmpfs over
+# /sys/class/drm) and records the exact flags handed to gamescope.
+name: audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/audit.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: syntax
+        continue-on-error: true
+        run: for f in autoscope install.sh uninstall.sh; do bash -n "$f"; done
+      - id: shellcheck_errors
+        continue-on-error: true
+        run: shellcheck -S error autoscope install.sh uninstall.sh
+      - name: shellcheck (all, informational)
+        run: shellcheck autoscope install.sh uninstall.sh || true
+      - id: secret_scan
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
+
+  install-and-detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: autoscope src   # path with spaces on purpose
+      # Installer is interactive: answer "1" (system package) like a new user.
+      - id: install_system_package
+        continue-on-error: true
+        working-directory: autoscope src
+        run: chmod +x install.sh && printf '1\n' | ./install.sh
+      - id: installed
+        continue-on-error: true
+        run: test -x /usr/local/bin/autoscope && command -v xrandr
+      - id: real_gamescope_present
+        continue-on-error: true
+        run: command -v gamescope && (gamescope --help 2>&1 | head -5)
+
+      - name: set up fakes (stub xrandr/gamescope, tmpfs /sys/class/drm)
+        run: |
+          mkdir -p "$RUNNER_TEMP/stubs"
+          cat > "$RUNNER_TEMP/stubs/xrandr" <<'EOF'
+          #!/bin/bash
+          echo "Screen 0: minimum 8 x 8, current 1920 x 1080, maximum 32767 x 32767"
+          echo "$FAKE_CONNECTOR connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 600mm x 340mm"
+          EOF
+          cat > "$RUNNER_TEMP/stubs/gamescope" <<'EOF'
+          #!/bin/bash
+          printf '%s\n' "$*" > "$RUNNER_TEMP/gamescope-args"
+          EOF
+          chmod +x "$RUNNER_TEMP/stubs/"*
+          echo "$RUNNER_TEMP/stubs" >> "$GITHUB_PATH"
+          sudo mount -t tmpfs drmfake /sys/class/drm
+          sudo chown "$USER" /sys/class/drm
+          # Laptop panel on card1 plus three external connectors on card0.
+          for c in card1-eDP-1:1920x1200 card0-DP-1:2560x1440 card0-HDMI-A-1:3840x2160 card0-DP-2:3440x1440; do
+            d=/sys/class/drm/${c%%:*}; mkdir -p "$d"; printf '%s\n%s\n' "${c##*:}" 1280x720 > "$d/modes"
+          done
+
+      - id: no_args_usage
+        continue-on-error: true
+        run: |
+          set +e; out=$(autoscope 2>&1); rc=$?; echo "$out"
+          [ "$rc" -eq 1 ] && grep -q Usage <<<"$out"
+      - id: detect_DP-1   # must not pick eDP-1 (issue #1)
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: DP-1 }
+        run: autoscope -- true && cat "$RUNNER_TEMP/gamescope-args" && grep -q -- '-W 2560 -H 1440' "$RUNNER_TEMP/gamescope-args"
+      - id: detect_HDMI-1   # xrandr HDMI-1 ↔ kernel HDMI-A-1 (issue #5)
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: HDMI-1 }
+        run: autoscope -- true && cat "$RUNNER_TEMP/gamescope-args" && grep -q -- '-W 3840 -H 2160' "$RUNNER_TEMP/gamescope-args"
+      - id: detect_eDP-1
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: eDP-1 }
+        run: autoscope -- true && cat "$RUNNER_TEMP/gamescope-args" && grep -q -- '-W 1920 -H 1200' "$RUNNER_TEMP/gamescope-args"
+      - id: detect_DP-2_ultrawide
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: DP-2 }
+        run: autoscope -- true && cat "$RUNNER_TEMP/gamescope-args" && grep -q -- '-W 3440 -H 1440' "$RUNNER_TEMP/gamescope-args"
+      - id: unknown_display_falls_back_1080p
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: XWAYLAND0 }
+        run: autoscope -- true && grep -q -- '-W 1920 -H 1080' "$RUNNER_TEMP/gamescope-args"
+      - id: user_override_respected
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: DP-1 }
+        run: |
+          autoscope -W 1280 -H 720 -- true; a=$(cat "$RUNNER_TEMP/gamescope-args"); echo "$a"
+          [ "$(grep -o -- '-W' <<<"$a" | wc -l)" -eq 1 ] && grep -q -- '-W 1280 -H 720' <<<"$a"
+      - id: override_scan_ignores_game_args   # issue #3: -W after -- belongs to the game
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: DP-1 }
+        run: autoscope -- mygame -W 5 && cat "$RUNNER_TEMP/gamescope-args" && grep -q -- '-W 2560 -H 1440' "$RUNNER_TEMP/gamescope-args"
+      - id: empty_modes_file   # issue #2
+        continue-on-error: true
+        env: { FAKE_CONNECTOR: DP-1 }
+        run: |
+          : > /sys/class/drm/card0-DP-1/modes
+          autoscope -- true; a=$(cat "$RUNNER_TEMP/gamescope-args"); echo "$a"
+          grep -qE -- '-W [0-9]+ -H [0-9]+' <<<"$a"
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
